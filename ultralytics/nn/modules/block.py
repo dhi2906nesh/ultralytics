@@ -166,27 +166,55 @@ class SPP(nn.Module):
         x = self.cv1(x)
         return self.cv2(torch.cat([x] + [m(x) for m in self.m], 1))
 
-
 class SPPF(nn.Module):
-    """Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher."""
+    """Modified Spatial Pyramid Pooling - Fast (SPPF) layer with sequential k=3 maxpools."""
 
-    def __init__(self, c1, c2, k=5):
+    def __init__(self, c1, c2, k=5):  # k parameter kept for compatibility but not used
         """
-        Initializes the SPPF layer with given input/output channels and kernel size.
-
-        This module is equivalent to SPP(k=(5, 9, 13)).
+        Initialize Modified SPPF layer with sequential k=3 maxpools.
+        Args:
+            c1: Input channels
+            c2: Output channels
+            k: Original kernel size (kept for compatibility)
         """
         super().__init__()
         c_ = c1 // 2  # hidden channels
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv(c_ * 4, c2, 1, 1)
-        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+        self.m = nn.MaxPool2d(kernel_size=3, stride=1, padding=1)
 
     def forward(self, x):
-        """Forward pass through Ghost Convolution block."""
-        y = [self.cv1(x)]
-        y.extend(self.m(y[-1]) for _ in range(3))
-        return self.cv2(torch.cat(y, 1))
+        """
+        Forward pass replacing original maxpool operations with sequential k=3 maxpools:
+        - Original k=5 -> two k=3 maxpools
+        - Original k=9 -> four k=3 maxpools
+        - Original k=13 -> six k=3 maxpools
+        """
+        x1 = self.cv1(x)
+        x2 = self.m(self.m(x1))              # Equivalent to k=5
+        x3 = self.m(self.m(self.m(self.m(x1))))  # Equivalent to k=9
+        x4 = self.m(self.m(self.m(self.m(self.m(self.m(x1))))))  # Equivalent to k=13
+        return self.cv2(torch.cat([x1, x2, x3, x4], 1))
+# class SPPF(nn.Module):
+#     """Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher."""
+
+#     def __init__(self, c1, c2, k=5):
+#         """
+#         Initializes the SPPF layer with given input/output channels and kernel size.
+
+#         This module is equivalent to SPP(k=(5, 9, 13)).
+#         """
+#         super().__init__()
+#         c_ = c1 // 2  # hidden channels
+#         self.cv1 = Conv(c1, c_, 1, 1)
+#         self.cv2 = Conv(c_ * 4, c2, 1, 1)
+#         self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+
+#     def forward(self, x):
+#         """Forward pass through Ghost Convolution block."""
+#         y = [self.cv1(x)]
+#         y.extend(self.m(y[-1]) for _ in range(3))
+#         return self.cv2(torch.cat(y, 1))
 
 
 class C1(nn.Module):
@@ -1000,47 +1028,84 @@ class PSA(nn.Module):
         b = b + self.ffn(b)
         return self.cv2(torch.cat((a, b), 1))
 
-
 class C2PSA(nn.Module):
-    """
-    C2PSA module with attention mechanism for enhanced feature extraction and processing.
+    """Modified Cross Stage Partial Network with Partial Spatial Attention (C2PSA) - SE layers removed"""
 
-    This module implements a convolutional block with attention mechanisms to enhance feature extraction and processing
-    capabilities. It includes a series of PSABlock modules for self-attention and feed-forward operations.
-
-    Attributes:
-        c (int): Number of hidden channels.
-        cv1 (Conv): 1x1 convolution layer to reduce the number of input channels to 2*c.
-        cv2 (Conv): 1x1 convolution layer to reduce the number of output channels to c.
-        m (nn.Sequential): Sequential container of PSABlock modules for attention and feed-forward operations.
-
-    Methods:
-        forward: Performs a forward pass through the C2PSA module, applying attention and feed-forward operations.
-
-    Notes:
-        This module essentially is the same as PSA module, but refactored to allow stacking more PSABlock modules.
-
-    Examples:
-        >>> c2psa = C2PSA(c1=256, c2=256, n=3, e=0.5)
-        >>> input_tensor = torch.randn(1, 256, 64, 64)
-        >>> output_tensor = c2psa(input_tensor)
-    """
-
-    def __init__(self, c1, c2, n=1, e=0.5):
-        """Initializes the C2PSA module with specified input/output channels, number of layers, and expansion ratio."""
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
         super().__init__()
-        assert c1 == c2
-        self.c = int(c1 * e)
-        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
-        self.cv2 = Conv(2 * self.c, c1, 1)
-
-        self.m = nn.Sequential(*(PSABlock(self.c, attn_ratio=0.5, num_heads=self.c // 64) for _ in range(n)))
-
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(PSABottleneck(c_, c_) for _ in range(n))
+        
     def forward(self, x):
-        """Processes the input tensor 'x' through a series of PSA blocks and returns the transformed tensor."""
-        a, b = self.cv1(x).split((self.c, self.c), dim=1)
-        b = self.m(b)
-        return self.cv2(torch.cat((a, b), 1))
+        y = list(self.m(self.cv1(x)))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv3(torch.cat((y[-1], self.cv2(x)), 1))
+
+class PSABottleneck(nn.Module):
+    """PSA Bottleneck without SE - Modified for quantization"""
+    
+    def __init__(self, c1, c2):
+        super().__init__()
+        c_ = c1 // 2
+        self.conv1 = Conv(c1, c_, 1, 1)
+        self.conv2 = Conv(c_, c_, 3, 1, g=1)
+        self.conv3 = Conv(c_, c2, 1, 1)
+        
+        # PSA module without SE
+        self.psa = nn.Sequential(
+            nn.Conv2d(c2, c2, 3, 1, 1, groups=c2),
+            nn.Conv2d(c2, c2, 1)
+        )
+        
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = self.conv3(out)
+        out = self.psa(out)
+        return out
+# class C2PSA(nn.Module):
+#     """
+#     C2PSA module with attention mechanism for enhanced feature extraction and processing.
+
+#     This module implements a convolutional block with attention mechanisms to enhance feature extraction and processing
+#     capabilities. It includes a series of PSABlock modules for self-attention and feed-forward operations.
+
+#     Attributes:
+#         c (int): Number of hidden channels.
+#         cv1 (Conv): 1x1 convolution layer to reduce the number of input channels to 2*c.
+#         cv2 (Conv): 1x1 convolution layer to reduce the number of output channels to c.
+#         m (nn.Sequential): Sequential container of PSABlock modules for attention and feed-forward operations.
+
+#     Methods:
+#         forward: Performs a forward pass through the C2PSA module, applying attention and feed-forward operations.
+
+#     Notes:
+#         This module essentially is the same as PSA module, but refactored to allow stacking more PSABlock modules.
+
+#     Examples:
+#         >>> c2psa = C2PSA(c1=256, c2=256, n=3, e=0.5)
+#         >>> input_tensor = torch.randn(1, 256, 64, 64)
+#         >>> output_tensor = c2psa(input_tensor)
+#     """
+
+#     def __init__(self, c1, c2, n=1, e=0.5):
+#         """Initializes the C2PSA module with specified input/output channels, number of layers, and expansion ratio."""
+#         super().__init__()
+#         assert c1 == c2
+#         self.c = int(c1 * e)
+#         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+#         self.cv2 = Conv(2 * self.c, c1, 1)
+
+#         self.m = nn.Sequential(*(PSABlock(self.c, attn_ratio=0.5, num_heads=self.c // 64) for _ in range(n)))
+
+#     def forward(self, x):
+#         """Processes the input tensor 'x' through a series of PSA blocks and returns the transformed tensor."""
+#         a, b = self.cv1(x).split((self.c, self.c), dim=1)
+#         b = self.m(b)
+#         return self.cv2(torch.cat((a, b), 1))
 
 
 class C2fPSA(C2f):
